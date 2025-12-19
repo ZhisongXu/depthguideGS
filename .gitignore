@@ -1,0 +1,39 @@
+*.pyc
+.vscode
+output
+build
+diff_rasterization/diff_rast.egg-info
+diff_rasterization/dist
+tensorboard_3d
+screenshots
+data/
+fig/
+wandb/
+
+# datasets / data
+data/
+dataset/
+datasets/
+*/data/
+*/datasets/
+
+# common large files
+*.zip
+*.tar
+*.tar.gz
+*.7z
+*.pth
+*.pt
+*.ckpt
+*.onnx
+*.npz
+*.npy
+*.mp4
+*.mov
+
+# outputs / logs
+outputs/
+runs/
+wandb/
+logs/
+checkpoints/
