@@ -439,24 +439,42 @@ def training(dataset, opt, pipe,
         if args.CS:
             loss += args.CS * loss_color
 
+
         # ======================================================
-        # 2) Depth loss — OLD SAD-GS
+        # 2) Depth (ABSOLUTE MINIMAL)
+        #   - no align, no mask, no max_depth, no sanitize
+        #   - only clamp negative gt to 0 (跟你 minimal 一样)
         # ======================================================
-        if args.DS and gt_depth is not None:
-            gt_d = gt_depth if torch.is_tensor(gt_depth) else torch.tensor(gt_depth)
-            gt_d = gt_d.to(image.device).float()
+        loss_depth = torch.tensor(0.0, device=image.device)
 
-            pred_d = depth.clone()
-            if pred_d.dim() == 2:
-                pred_d = pred_d.unsqueeze(0)
-            if gt_d.dim() == 2:
-                gt_d = gt_d.unsqueeze(0)
+        if (args.DS is not None) and (args.DS > 0) and (gt_depth is not None):
+            gt_depth_ = gt_depth
+            if not torch.is_tensor(gt_depth_):
+                gt_depth_ = torch.tensor(gt_depth_, device=image.device)
+            gt_depth_ = gt_depth_.to(image.device).float()
 
-            gt_d[gt_d < 0] = 0
-            pred_d[0][gt_d[0] == 0] = 0   # ★ 老 SAD-GS 核心
+            # make sure gt is [H,W]
+            if gt_depth_.dim() == 3:
+                gt_depth_ = gt_depth_[0]
 
-            loss_depth = l1_loss(pred_d, gt_d)
-            loss += args.DS * loss_depth
+            # renderer depth is usually [1,H,W]; keep it as-is (跟 minimal 一样 clone)
+            pred_depth = depth.clone()
+
+            # minimal clamp
+            gt_depth_[gt_depth_ < 0] = 0
+
+            # EXACT minimal computation
+            depth_term = l1_loss(pred_depth, gt_depth_)
+
+            # warmup (跟 minimal 一样)
+            if getattr(args, "depth_warmup_iters", 0) > 0 and iteration < args.depth_warmup_iters:
+                w = args.DS * float(iteration) / float(args.depth_warmup_iters)
+            else:
+                w = args.DS
+
+            loss += depth_term * w
+            loss_depth = depth_term * w
+
 
         # ======================================================
         # 3) Alpha loss（如果你开）
@@ -512,6 +530,9 @@ def training(dataset, opt, pipe,
         #   MVD: depth consistency (warp ref depth->src) with occlusion-aware gating using z_pred_in_ref
         # ======================================================
         do_mv = (iteration >= args.mv_start_iter) and ((iteration % args.mv_interval) == 0)
+        if getattr(args, "mv_end_iter", 0) and args.mv_end_iter > 0:
+            do_mv = do_mv and (iteration <= args.mv_end_iter)
+
         if do_mv and (len(viewpoint_stack_all) > 1) and ((args.MV_C and args.MV_C > 0) or (args.MV_D and args.MV_D > 0)):
             d_src = depth[0] if depth.dim() == 3 else depth
             d_src = d_src.clone()
@@ -573,18 +594,19 @@ def training(dataset, opt, pipe,
 
                 # MVD mask (need ref depth + occlusion-aware gating)
                 if args.MV_D and args.MV_D > 0:
-                    md = m & (ref_dep_warp > 0)
+                    md = m & (ref_dep_warp > 0) & (z_ref_pred > 0) & torch.isfinite(z_ref_pred)
 
-                    # occlusion-aware
+                    # occlusion-aware gate (this is the correct pair to gate on)
                     if args.mv_occ_th is not None and args.mv_occ_th > 0:
                         md = md & (torch.abs(ref_dep_warp - z_ref_pred) < args.mv_occ_th)
 
                     if md.sum().item() >= args.mv_min_valid:
                         if args.mv_align_depth:
-                            ref_aligned, _ = align_scale_shift(ref_dep_warp, d_src, md)
-                            mv_d_acc = mv_d_acc + charbonnier(d_src[md] - ref_aligned[md]).mean()
+                            # optional: align ref_dep_warp -> z_ref_pred (same coordinate system: ref camera Z)
+                            ref_aligned, _ = align_scale_shift(ref_dep_warp, z_ref_pred, md)
+                            mv_d_acc = mv_d_acc + charbonnier(ref_aligned[md] - z_ref_pred[md]).mean()
                         else:
-                            mv_d_acc = mv_d_acc + charbonnier(d_src[md] - ref_dep_warp[md]).mean()
+                            mv_d_acc = mv_d_acc + charbonnier(ref_dep_warp[md] - z_ref_pred[md]).mean()
                         used_d += 1
 
             if used_c > 0 and args.MV_C and args.MV_C > 0:
@@ -677,11 +699,18 @@ def training(dataset, opt, pipe,
         iter_end.record()
 
         with torch.no_grad():
-            ema_loss_for_log = 0.4 * loss.item() + 0.6 * ema_loss_for_log
+            # -----------------------------
+            # EMA + progress
+            # -----------------------------
+            ema_loss_for_log = 0.4 * float(loss.item()) + 0.6 * float(ema_loss_for_log)
+
             if iteration % 10 == 0:
                 progress_bar.set_postfix({"Loss": f"{ema_loss_for_log:.7f}"})
                 progress_bar.update(10)
 
+            # -----------------------------
+            # periodic print
+            # -----------------------------
             if iteration % 100 == 0:
                 print(
                     f"[{iteration:06d}] "
@@ -697,52 +726,74 @@ def training(dataset, opt, pipe,
                     f"(mv_used={'yes' if do_mv else 'no'})"
                 )
 
+            # -----------------------------
+            # wall time + cuda timing
+            # -----------------------------
             toc = time.time()
             total_computing_time += (toc - tic)
 
-            # optional: ensure CUDA timing is correct before reading elapsed_time
+            # ensure CUDA events are ready before reading elapsed_time
             torch.cuda.synchronize()
+            iter_ms = iter_start.elapsed_time(iter_end)
 
+            # -----------------------------
+            # eval / tb
+            # -----------------------------
             training_report(
                 tb_writer, iteration, Ll1, loss, l1_loss,
-                iter_start.elapsed_time(iter_end),
-                testing_iterations, scene, render, (pipe, background)
+                iter_ms, testing_iterations, scene, render, (pipe, background)
             )
 
+            # -----------------------------
+            # save gaussians
+            # -----------------------------
             if iteration in saving_iterations:
                 print(f"\n[ITER {iteration}] Saving Gaussians")
                 scene.save(iteration)
 
             # ======================================================
-            # ORIGINAL SAD-GS DENSIFICATION (keep exactly)
+            # Densify / Prune (SAD-GS core + your vacuum/guard)
             # ======================================================
             if iteration < opt.densify_until_iter:
+                # SAD-GS stats
                 gaussians.max_radii2D[visibility_filter] = torch.max(
                     gaussians.max_radii2D[visibility_filter], radii[visibility_filter]
                 )
                 gaussians.add_densification_stats(viewspace_point_tensor, visibility_filter)
 
-                if iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0:
+                # densify interval
+                if iteration > opt.densify_from_iter and (iteration % opt.densification_interval == 0):
                     size_threshold = 20 if iteration > opt.opacity_reset_interval else None
+
                     gaussians.densify_and_prune_original(
-                        opt.densify_grad_threshold, 0.005,
-                        scene.cameras_extent, size_threshold
+                        opt.densify_grad_threshold,
+                        float(args.prune_low_alpha),
+                        scene.cameras_extent,
+                        size_threshold
                     )
 
-            if iteration % opt.opacity_reset_interval == 0 or (dataset.white_background and iteration == opt.densify_from_iter):
-                print('reset_opacity !!!')
-                gaussians.reset_opacity()
+                # opacity reset 只在 densify 阶段做（后期不频繁 reset）
+                if (iteration % opt.opacity_reset_interval == 0) or (dataset.white_background and iteration == opt.densify_from_iter):
+                    print("reset_opacity !!! (densify stage)")
+                    gaussians.reset_opacity()
 
+            # ======================================================
+            # Optim step
+            # ======================================================
             if iteration < opt.iterations:
                 gaussians.optimizer.step()
                 gaussians.optimizer.zero_grad(set_to_none=True)
 
+            # ======================================================
+            # Checkpoint
+            # ======================================================
             if iteration in checkpoint_iterations:
                 print(f"\n[ITER {iteration}] Saving Checkpoint")
                 torch.save(
                     (gaussians.capture(), iteration),
                     scene.model_path + "/chkpnt" + str(iteration) + ".pth"
                 )
+
 
     progress_bar.close()
     print("\nTraining complete.")
@@ -772,13 +823,13 @@ if __name__ == "__main__":
     # Loss weights (1~6 default ON)
     # -------------------------
     parser.add_argument("--CS", type=float, default=1.0)
-    parser.add_argument("--DS", type=float, default=0.2)
+    parser.add_argument("--DS", type=float, default=0.3)
     parser.add_argument("--alpha_loss", type=float, default=0.0)
 
     parser.add_argument("--SC", type=float, default=1e-4)
-    parser.add_argument("--NC", type=float, default=0.02)
-    parser.add_argument("--MV_C", type=float, default=0.05)
-    parser.add_argument("--MV_D", type=float, default=0.2)
+    parser.add_argument("--NC", type=float, default=0.01)
+    parser.add_argument("--MV_C", type=float, default=0.03)
+    parser.add_argument("--MV_D", type=float, default=0.03)
 
     # NC config
     parser.add_argument("--NC_edge", type=float, default=10.0)
@@ -789,12 +840,13 @@ if __name__ == "__main__":
     parser.add_argument("--ds_min_valid", type=int, default=2000)
     parser.add_argument("--ds_max_depth", type=float, default=10.0)
 
-    # MV config
-    parser.add_argument("--mv_start_iter", type=int, default=1)
-    parser.add_argument("--mv_interval", type=int, default=1)     # every step for debug
+    # MV config  (RARE by default)
+    parser.add_argument("--mv_start_iter", type=int, default=2000)   # 2000后才允许
+    parser.add_argument("--mv_interval", type=int, default=5)       # 每20步才尝试一次
     parser.add_argument("--mv_pairs", type=int, default=1)
     parser.add_argument("--mv_max_depth", type=float, default=10.0)
-    parser.add_argument("--mv_min_valid", type=int, default=2000)
+    parser.add_argument("--mv_min_valid", type=int, default=6000)    # 更严格，减少“算出来”的次数
+    parser.add_argument("--mv_end_iter", type=int, default=12000)  # 0/负数=不截止
 
     # MV depth consistency (occlusion-aware)
     parser.add_argument("--mv_occ_th", type=float, default=0.05)         # meters-ish; tune 0.02~0.1
@@ -814,6 +866,15 @@ if __name__ == "__main__":
     parser.add_argument("--reset_opa_near", action="store_true", default=False)
     parser.add_argument("--fov_mask", action="store_true", default=False)
     parser.add_argument("--full_reset_opa", action="store_true", default=False)
+    # -------------------------
+    # Densify / prune extras
+    # -------------------------
+    parser.add_argument("--prune_low_alpha", type=float, default=0.005)
+    parser.add_argument("--hard_vacuum_until", type=int, default=8000)
+    parser.add_argument("--vacuum_alpha", type=float, default=0.01)
+    parser.add_argument("--prune_min_points", type=int, default=0)  # 0 = disable guard
+    parser.add_argument("--depth_warmup_iters", type=int, default=2000)
+
 
     # -------------------------
     # Scene options
