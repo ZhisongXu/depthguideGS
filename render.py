@@ -148,6 +148,27 @@ def render_sets(dataset, iteration, pipeline, single_frame_id, use_pseudo_cam):
                             gaussians, pipeline, background)
 
 
+def apply_depth_colormap(
+    depth,
+    accumulation,
+    near_plane = 2.0,
+    far_plane = 6.0,
+    cmap="turbo",
+):
+    near_plane = near_plane or float(torch.min(depth))
+    far_plane = far_plane or float(torch.max(depth))
+
+    depth = (depth - near_plane) / (far_plane - near_plane + 1e-10)
+    depth = torch.clip(depth, 0, 1)
+    # depth = torch.nan_to_num(depth, nan=0.0) # TODO(ethan): remove this
+
+    colored_image = apply_colormap(depth, cmap=cmap)
+
+    if accumulation is not None:
+        colored_image = colored_image * accumulation + (1 - accumulation)
+
+    return colored_image
+
 if __name__ == "__main__":
     parser = ArgumentParser(description="Render all views")
     model = ModelParams(parser, sentinel=True)
