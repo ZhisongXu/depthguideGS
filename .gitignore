@@ -37,3 +37,16 @@ runs/
 wandb/
 logs/
 checkpoints/
+
+# ===== BIG scene / dataset (MUST IGNORE) =====
+scene0207_00/
+scene0207_00_sub10/
+scene*/
+scene*_sub*/
+
+# ===== Training outputs =====
+outputs/
+checkpoints/
+logs/
+runs/
+wandb/
