@@ -50,3 +50,10 @@ checkpoints/
 logs/
 runs/
 wandb/
+
+# ===== BIG office scenes (MUST IGNORE) =====
+office1/
+office1_sub/
+office*/
+office*_sub*/
+
